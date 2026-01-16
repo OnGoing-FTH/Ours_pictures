@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <title>专属相册</title>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; font-family: "Microsoft YaHei", sans-serif; }
+        #btn { position: absolute; bottom: 40px; left: 50%; transform: translateX(-50%); 
+               padding: 16px 45px; background: linear-gradient(135deg, #1d6a3c, #2ecc71); 
+               color: white; border: none; border-radius: 50px; cursor: pointer; z-index: 100; 
+               font-size: 16px; font-weight: bold; letter-spacing: 3px; 
+               box-shadow: 0 10px 40px rgba(46, 204, 113, 0.4); display: none; transition: 0.4s; }
+        #btn:hover { transform: translateX(-50%) scale(1.08); }
+        #loader { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); color: #fff; text-align: center; }
+        .progress-container { width: 250px; height: 1px; background: rgba(255,255,255,0.1); margin-top: 15px; }
+        #bar { width: 0%; height: 100%; background: #2ecc71; transition: width 0.3s; }
+        .hint { position: absolute; top: 30px; width: 100%; text-align: center; color: rgba(255,255,255,0.3); font-size: 12px; pointer-events: none; }
+    </style>
+</head>
+<body>
+    <!-- 音乐文件建议命名为 bgm.mp3 放在根目录 -->
+    <audio id="bgm" loop src="bgm.mp3"></audio>
+    <!-- 音乐控制图标 -->
+    <div id="music-ctrl" style="position: absolute; top: 20px; right: 20px; z-index: 1000; cursor: pointer; color: white; font-size: 24px; opacity: 0.5;">
+        <span id="music-icon">🔇</span>
+    </div>
+    <div id="loader">
+        <div style="letter-spacing: 2px; font-size: 13px; opacity: 0.8;">正在构建 3D 记忆空间...</div>
+        <div class="progress-container"><div id="bar"></div></div>
+    </div>
+    <div class="hint">右上角打开音乐，点击图像可放大，亦可自动放映</div>
+    <button id="btn">记忆汇聚 · 遇见幸运</button>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.9.1/gsap.min.js"></script>
+
+    <script>
+        let scene, camera, renderer, photoGroup, particleSystem;
+        let focusedPhoto = null, isTransitioning = false;
+        let autoTimer = null, manualReturnTimer = null;
+        const IMG_COUNT = 20, RING_RADIUS = 650;
+
+        init();
+        const bgm = document.getElementById('bgm');
+        const musicIcon = document.getElementById('music-icon');
+        let musicStarted = false;
+
+        // 音乐开关切换
+        document.getElementById('music-ctrl').onclick = (e) => {
+            e.stopPropagation();
+            if (bgm.paused) {
+                bgm.play();
+                musicIcon.innerText = '🎵';
+            } else {
+                bgm.pause();
+                musicIcon.innerText = '🔇';
+            }
+        };
+
+        async function init() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 1, 5000);
+            camera.position.set(0, 50, 1200);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            document.body.appendChild(renderer.domElement);
+
+            photoGroup = new THREE.Group();
+            scene.add(photoGroup);
+
+            const loader = new THREE.TextureLoader();
+            loader.setCrossOrigin('anonymous');
+            let loaded = 0;
+
+            for(let i=1; i<=IMG_COUNT; i++) {
+                loader.load(`pics/${i}.jpg`, (tex) => {
+                    createPhoto(tex, i-1);
+                    checkLoaded(++loaded);
+                }, undefined, () => {
+                    // 容错：占位图
+                    loader.load(`https://picsum.photos/id/${i+10}/400/600`, (tex) => {
+                        createPhoto(tex, i-1);
+                        checkLoaded(++loaded);
+                    });
+                });
+            }
+            window.addEventListener('click', onDocumentClick);
+            animate();
+        }
+
+        function checkLoaded(v) {
+            document.getElementById('bar').style.width = (v/IMG_COUNT)*100 + '%';
+            if(v === IMG_COUNT) {
+                document.getElementById('loader').style.display = 'none';
+                document.getElementById('btn').style.display = 'block';
+                startAutoCycle();
+            }
+        }
+
+        function createPhoto(tex, idx) {
+            const aspect = tex.image.width / tex.image.height;
+            const h = 240, w = h * aspect;
+            const mesh = new THREE.Mesh(
+                new THREE.PlaneGeometry(w, h),
+                new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide, transparent: true })
+            );
+            const angle = (idx / IMG_COUNT) * Math.PI * 2;
+            mesh.position.set(Math.cos(angle)*RING_RADIUS, (Math.random()-0.5)*150, Math.sin(angle)*RING_RADIUS);
+            mesh.lookAt(0, 0, 0);
+            mesh.userData = { homePos: mesh.position.clone(), homeRot: mesh.rotation.clone(), texture: tex, w, h, index: idx };
+            photoGroup.add(mesh);
+        }
+
+        // --- 核心逻辑：入场展示 ---
+        function focusPhoto(mesh) {
+            if (focusedPhoto === mesh || isTransitioning) return;
+            
+            // 如果当前已有照片在展示，立即让它归位
+            if(focusedPhoto) returnToRing(focusedPhoto, true);
+
+            focusedPhoto = mesh;
+            scene.attach(mesh); // 脱离旋转组
+
+            // 动画：从左侧飞入中心
+            mesh.position.set(-1200, 0, 800);
+            mesh.rotation.set(0, 0, 0);
+            
+            gsap.to(mesh.position, { x: 0, y: 0, z: 850, duration: 1.2, ease: "power3.out" });
+            
+            // 背景变暗
+            photoGroup.children.forEach(p => {
+                if(p !== mesh) gsap.to(p.material, { opacity: 0.1, duration: 0.8 });
+            });
+
+            // --- 关键：手动/自动 5秒后自动归位 ---
+            clearTimeout(manualReturnTimer);
+            manualReturnTimer = setTimeout(() => {
+                if(focusedPhoto === mesh) returnToRing(mesh);
+            }, 5000); 
+        }
+
+        // --- 核心逻辑：归位离场 ---
+        function returnToRing(mesh, quick = false) {
+            if(!mesh) return;
+            
+            const duration = quick ? 0.5 : 0.8;
+            // 向右侧飞出
+            gsap.to(mesh.position, { 
+                x: 1200, 
+                duration: duration, 
+                ease: "power3.in", 
+                onComplete: () => {
+                    photoGroup.attach(mesh);
+                    // 飞回圆环原位
+                    gsap.to(mesh.position, { x: mesh.userData.homePos.x, y: mesh.userData.homePos.y, z: mesh.userData.homePos.z, duration: 1 });
+                    gsap.to(mesh.rotation, { x: mesh.userData.homeRot.x, y: mesh.userData.homeRot.y, z: mesh.userData.homeRot.z, duration: 1 });
+                    gsap.to(mesh.material, { opacity: 1, duration: 0.5 });
+                }
+            });
+
+            photoGroup.children.forEach(p => {
+                if(p !== mesh) gsap.to(p.material, { opacity: 1, duration: 1 });
+            });
+
+            if(focusedPhoto === mesh) focusedPhoto = null;
+        }
+
+        function startAutoCycle() {
+            let i = 0;
+            autoTimer = setInterval(() => {
+                if (!isTransitioning && !focusedPhoto) {
+                    focusPhoto(photoGroup.children[i % IMG_COUNT]);
+                    i++;
+                }
+            }, 8000); // 8秒一个周期（包含展示时间）
+        }
+
+        function onDocumentClick(e) {
+            if (isTransitioning) return;
+            const m = new THREE.Vector2((e.clientX/window.innerWidth)*2-1, -(e.clientY/window.innerHeight)*2+1);
+            const ray = new THREE.Raycaster(); ray.setFromCamera(m, camera);
+            const hits = ray.intersectObjects(photoGroup.children.concat(focusedPhoto || []));
+            
+            if(hits.length > 0) {
+                // 手动点击：重置自动计时器，优先展示点击项
+                focusPhoto(hits[0].object);
+            }
+        }
+
+        // --- 核心：视觉升级版四叶草 ---
+        function buildClover() {
+            const P_PER_IMG = 1500, total = IMG_COUNT * P_PER_IMG;
+            const geo = new THREE.BufferGeometry();
+            const posArr = new Float32Array(total * 3), colArr = new Float32Array(total * 3);
+            const tarArr = new Float32Array(total * 3), tarColArr = new Float32Array(total * 3);
+
+            photoGroup.children.concat(focusedPhoto ? [focusedPhoto] : []).forEach(mesh => {
+                const imgIdx = mesh.userData.index;
+                const data = getPixelData(mesh.userData.texture.image);
+                const worldPos = new THREE.Vector3(); mesh.getWorldPosition(worldPos);
+                const worldQuat = new THREE.Quaternion(); mesh.getWorldQuaternion(worldQuat);
+
+                for(let i=0; i<P_PER_IMG; i++) {
+                    const idx = imgIdx * P_PER_IMG + i;
+                    const px = i % 40, py = Math.floor(i / 40);
+                    const lp = new THREE.Vector3((px-20)*(mesh.userData.w/40), (20-py)*(mesh.userData.h/40), 0);
+                    lp.applyQuaternion(worldQuat);
+                    posArr[idx*3] = worldPos.x + lp.x; posArr[idx*3+1] = worldPos.y + lp.y; posArr[idx*3+2] = worldPos.z + lp.z;
+                    const ci = (py*40 + px)*4;
+                    colArr[idx*3] = data[ci]/255; colArr[idx*3+1] = data[ci+1]/255; colArr[idx*3+2] = data[ci+2]/255;
+
+                    const isStem = i < P_PER_IMG * 0.15;
+                    if(isStem) {
+                        const t = Math.random();
+                        tarArr[idx*3] = Math.sin(t * 3) * 30 - 10;
+                        tarArr[idx*3+1] = -t * 350 - 60;
+                        tarArr[idx*3+2] = -t * 20;
+                        tarColArr[idx*3] = 0.05; tarColArr[idx*3+1] = 0.2 + Math.random()*0.1; tarColArr[idx*3+2] = 0.05;
+                    } else {
+                        const leafIdx = imgIdx % 4;
+                        const angle = leafIdx * Math.PI/2 + Math.PI/4;
+                        const t = Math.random() * Math.PI * 2;
+                        const r = Math.sqrt(Math.random());
+                        let tx = 16 * Math.pow(Math.sin(t), 3);
+                        let ty = 13 * Math.cos(t) - 5 * Math.cos(2*t) - 2 * Math.cos(3*t) - Math.cos(4*t);
+                        const s = r * 14.5;
+                        tarArr[idx*3] = (tx * Math.cos(angle) - ty * Math.sin(angle)) * s;
+                        tarArr[idx*3+1] = (tx * Math.sin(angle) + ty * Math.cos(angle)) * s;
+                        // V型褶皱
+                        tarArr[idx*3+2] = Math.abs(Math.sin(t)) * 25 * r + (Math.random()-0.5)*5;
+                        // 渐变色
+                        tarColArr[idx*3] = 0.05 + r * 0.4; tarColArr[idx*3+1] = 0.2 + r * 0.7; tarColArr[idx*3+2] = 0.05;
+                    }
+                }
+            });
+
+            geo.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
+            geo.setAttribute('color', new THREE.BufferAttribute(colArr, 3));
+            particleSystem = new THREE.Points(geo, new THREE.PointsMaterial({
+                size: 5, vertexColors: true, transparent: true, blending: THREE.AdditiveBlending,
+                map: createGlowTex(), depthWrite: false
+            }));
+            scene.add(particleSystem);
+            return { tarArr, tarColArr };
+        }
+
+        function getPixelData(img) {
+            const c = document.createElement('canvas'); c.width = 40; c.height = 40;
+            const ctx = c.getContext('2d'); ctx.drawImage(img, 0, 0, 40, 40);
+            return ctx.getImageData(0,0,40,40).data;
+        }
+
+        function createGlowTex() {
+            const c = document.createElement('canvas'); c.width = 64; c.height = 64;
+            const ctx = c.getContext('2d');
+            const g = ctx.createRadialGradient(32,32,0,32,32,32);
+            g.addColorStop(0,'rgba(255,255,255,1)'); g.addColorStop(0.3,'rgba(180,255,180,0.3)'); g.addColorStop(1,'transparent');
+            ctx.fillStyle = g; ctx.fillRect(0,0,64,64);
+            return new THREE.CanvasTexture(c);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            if(!isTransitioning) photoGroup.rotation.y += 0.003;
+            else if(particleSystem) {
+                particleSystem.rotation.y += 0.0015;
+                particleSystem.position.y = Math.sin(Date.now()*0.001)*10;
+            }
+            renderer.render(scene, camera);
+        }
+
+        document.getElementById('btn').onclick = () => {
+            isTransitioning = true; 
+            clearInterval(autoTimer); clearTimeout(manualReturnTimer);
+            const { tarArr, tarColArr } = buildClover();
+            photoGroup.visible = false; if(focusedPhoto) focusedPhoto.visible = false;
+            document.getElementById('btn').style.display = 'none';
+
+            const pos = particleSystem.geometry.attributes.position;
+            const col = particleSystem.geometry.attributes.color;
+            for(let i=0; i<pos.count; i++) {
+                const delay = Math.random() * 1.0;
+                gsap.to(pos.array, {
+                    [i*3]: tarArr[i*3], [i*3+1]: tarArr[i*3+1], [i*3+2]: tarArr[i*3+2],
+                    duration: 3 + Math.random()*2, delay, ease: "expo.inOut", onUpdate: () => pos.needsUpdate = true
+                });
+                gsap.to(col.array, {
+                    [i*3]: tarColArr[i*3], [i*3+1]: tarColArr[i*3+1], [i*3+2]: tarColArr[i*3+2],
+                    duration: 4, delay, onUpdate: () => col.needsUpdate = true
+                });
+            }
+            gsap.to(camera.position, { z: 950, y: 180, duration: 5, ease: "power2.inOut" });
+        };
+
+        window.onresize = () => {
+            camera.aspect = window.innerWidth/window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        };
+    </script>
+</body>
+</html>
